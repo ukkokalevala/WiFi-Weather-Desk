@@ -1,0 +1,265 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+#include <time.h>
+
+// ---------- PINS ----------
+#define I2C_SDA   7
+#define I2C_SCL   6
+#define BTN_PIN   9     // Button on GPIO 9
+
+// ---------- CONFIG ----------
+const char* WIFI_SSID     = "YOUR_SSID";
+const char* WIFI_PASSWORD = "YOUR_PASSWORD";
+
+// Cape Town Coordinates
+const float LAT = -33.9252;
+const float LON = 18.4238;
+const char* TZ_STR = "SAST-2"; // South Africa Standard Time
+
+// ---------- OBJECTS ----------
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ---------- STATE ----------
+struct NetWeather { 
+  float temp = NAN; 
+  float feelsLike = NAN;
+  float windSpeed = NAN;
+  int code = -1; 
+  bool isDay = true; 
+  bool valid = false; 
+} netWeather;
+
+uint8_t page = 0;
+const uint8_t PAGE_COUNT = 2; // 2 pages: 0=Weather, 1=Clock
+unsigned long lastWeatherFetch = 0;
+const unsigned long WEATHER_INTERVAL = 600000UL; // 10 mins
+
+// ---------- ICONS ----------
+void drawSun(int cx, int cy, int r) {
+  u8g2.drawDisc(cx, cy, r);
+  for (int a = 0; a < 360; a += 45) {
+    float rad = a * DEG_TO_RAD;
+    u8g2.drawLine(cx + cos(rad)*(r+2), cy + sin(rad)*(r+2),
+                  cx + cos(rad)*(r+6), cy + sin(rad)*(r+6));
+  }
+}
+
+void drawCloud(int cx, int cy) {
+  u8g2.drawDisc(cx-8, cy+2, 7); u8g2.drawDisc(cx+2, cy-3, 9);
+  u8g2.drawDisc(cx+11, cy+2, 7); u8g2.drawBox(cx-8, cy+2, 20, 7);
+}
+
+void drawRain(int cx, int cy) {
+  drawCloud(cx, cy-4);
+  for (int i=0;i<4;i++){int x=cx-10+i*7; u8g2.drawLine(x, cy+8, x-2, cy+13);}
+}
+
+void drawSnow(int cx, int cy) {
+  drawCloud(cx, cy-4);
+  for (int i=0;i<4;i++){int x=cx-10+i*7;
+    u8g2.drawPixel(x,cy+10);u8g2.drawPixel(x-1,cy+11);
+    u8g2.drawPixel(x+1,cy+11);u8g2.drawPixel(x,cy+12);}
+}
+
+void drawThunder(int cx, int cy) {
+  drawCloud(cx, cy-4);
+  u8g2.drawLine(cx+2,cy+8, cx-2,cy+13);
+  u8g2.drawLine(cx-2,cy+13, cx+1,cy+13);
+  u8g2.drawLine(cx+1,cy+13, cx-3,cy+18);
+}
+
+void drawMist(int cx, int cy) {
+  for (int i=0;i<3;i++) u8g2.drawLine(cx-12, cy-4+i*6, cx+12, cy-4+i*6);
+}
+
+void drawWeatherByCode(int code, int cx, int cy, bool isDay) {
+  if (code == 0) {
+    if (isDay) drawSun(cx,cy,10);
+    else { u8g2.drawDisc(cx,cy,10); u8g2.drawDisc(cx+5,cy-3,8); }
+  } else if (code <= 3) { drawSun(cx-6,cy-6,6); drawCloud(cx+3,cy+3); }
+  else if (code == 45 || code == 48) drawMist(cx,cy);
+  else if (code >= 51 && code <= 67) drawRain(cx,cy);
+  else if (code >= 71 && code <= 77) drawSnow(cx,cy);
+  else if (code >= 80 && code <= 82) drawRain(cx,cy);
+  else if (code >= 85 && code <= 86) drawSnow(cx,cy);
+  else if (code >= 95) drawThunder(cx,cy);
+  else drawCloud(cx,cy);
+}
+
+const char* getWeatherText(int code) {
+  if (code == 0) return "Clear Sky";
+  if (code <= 3) return "Partly Cloudy";
+  if (code == 45 || code == 48) return "Foggy";
+  if (code >= 51 && code <= 55) return "Drizzle";
+  if (code >= 61 && code <= 65) return "Rain";
+  if (code >= 71 && code <= 77) return "Snow";
+  if (code >= 80 && code <= 82) return "Showers";
+  if (code >= 95) return "Thunderstorm";
+  return "Cloudy";
+}
+
+// ---------- WEATHER API ----------
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  String url = "http://api.open-meteo.com/v1/forecast?latitude=" + String(LAT,4) +
+               "&longitude=" + String(LON,4) +
+               "&current=temperature_2m,apparent_temperature,weather_code,is_day,wind_speed_10m&timezone=auto";
+               
+  HTTPClient http;
+  http.begin(url);
+  int code = http.GET();
+  
+  if (code == 200) {
+    String payload = http.getString();
+    StaticJsonDocument<1024> doc;
+    if (!deserializeJson(doc, payload)) {
+      netWeather.temp      = doc["current"]["temperature_2m"] | NAN;
+      netWeather.feelsLike = doc["current"]["apparent_temperature"] | NAN;
+      netWeather.windSpeed = doc["current"]["wind_speed_10m"] | NAN;
+      netWeather.code      = doc["current"]["weather_code"] | -1;
+      netWeather.isDay     = (doc["current"]["is_day"] | 1) == 1;
+      netWeather.valid     = !isnan(netWeather.temp);
+    }
+  }
+  http.end();
+  lastWeatherFetch = millis();
+}
+
+// ---------- WIFI / TIME ----------
+void connectWiFi() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 12, "Connecting WiFi...");
+  u8g2.sendBuffer();
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis()-start < 15000) delay(300);
+}
+
+void syncTime() {
+  configTzTime(TZ_STR, "pool.ntp.org", "time.nist.gov");
+  struct tm tm_now;
+  for (int i=0;i<20;i++) if (getLocalTime(&tm_now,1000)) return;
+}
+
+// ---------- PAGES ----------
+void drawWeatherPage() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0,9,"CAPE TOWN");
+  u8g2.drawHLine(0,11,128);
+  
+  if (!netWeather.valid) {
+    u8g2.drawStr(0,30,"No data yet...");
+    u8g2.drawStr(0,45,"Check WiFi / wait");
+    u8g2.sendBuffer();
+    return;
+  }
+  
+  // Draw Big Icon on the right
+  drawWeatherByCode(netWeather.code, 102, 35, netWeather.isDay);
+  
+  char buf[24];
+  
+  // Big Temperature
+  u8g2.setFont(u8g2_font_10x20_tf);
+  snprintf(buf,24,"%.1fC",netWeather.temp);
+  u8g2.drawStr(0,32,buf);
+  
+  // Weather Description
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 44, getWeatherText(netWeather.code));
+  
+  // Wind & Feels Like
+  u8g2.setFont(u8g2_font_5x7_tf);
+  snprintf(buf,24,"Feels: %.0fC  Wind: %.0f km/h", netWeather.feelsLike, netWeather.windSpeed);
+  u8g2.drawStr(0, 54, buf);
+  
+  u8g2.sendBuffer();
+}
+
+void drawClockPage() {
+  u8g2.clearBuffer();
+  struct tm tm_now;
+  if (!getLocalTime(&tm_now,10)) {
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0,30,"Time not synced");
+    u8g2.sendBuffer();
+    return;
+  }
+  char tb[16];
+  u8g2.setFont(u8g2_font_logisoso24_tn);
+  strftime(tb,16,"%H:%M",&tm_now);
+  u8g2.drawStr(14,42,tb);
+  
+  u8g2.setFont(u8g2_font_7x14_tf);
+  strftime(tb,16,"%a %d %b %Y",&tm_now);
+  u8g2.drawStr(8,60,tb);
+  
+  u8g2.sendBuffer();
+}
+
+void drawPage() {
+  if (page == 0) drawWeatherPage();
+  else drawClockPage();
+}
+
+// ---------- BUTTON ----------
+void handleButton() {
+  static bool lastState = HIGH;
+  static unsigned long lastChange = 0;
+  bool state = digitalRead(BTN_PIN);
+  if (state != lastState && millis()-lastChange > 50) {
+    lastChange = millis();
+    if (state == LOW) { 
+      page = (page+1) % PAGE_COUNT; 
+      drawPage(); 
+    }
+    lastState = state;
+  }
+}
+
+// ---------- SETUP / LOOP ----------
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL, 400000);
+  
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  
+  u8g2.begin();
+  u8g2.setContrast(255);
+
+  connectWiFi();
+  if (WiFi.status() == WL_CONNECTED) {
+    syncTime();
+    fetchWeather();
+  }
+  
+  drawPage();
+}
+
+void loop() {
+  handleButton();
+  
+  // Fetch internet weather every 10 minutes
+  if (millis() - lastWeatherFetch > WEATHER_INTERVAL) {
+    fetchWeather();
+    if (page == 0) drawPage();
+  }
+  
+  // Refresh screen once per second (keeps clock updated)
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw > 1000) {
+    lastDraw = millis();
+    drawPage();
+  }
+  
+  delay(10);
+}
