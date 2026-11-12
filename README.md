@@ -1,0 +1,1 @@
+A beautiful, internet-connected weather station for the ESP32-C3. Fetches live Cape Town weather via Open-Meteo, renders custom OLED graphics, and features an NTP clock. Built with Arduino, U8g2, and Wi-Fi.
